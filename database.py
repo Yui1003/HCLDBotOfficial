@@ -153,7 +153,6 @@ async def get_active_user_by_game_id(
 
 
 
-# NEW COMMAND SUPPORT
 async def get_verified_users():
 
     async with aiosqlite.connect(DB_NAME) as db:
@@ -224,3 +223,80 @@ async def mark_removed(
         )
 
         await db.commit()
+
+
+
+async def get_user_by_game_id(
+    game_id
+):
+
+    async with aiosqlite.connect(DB_NAME) as db:
+
+        cursor = await db.execute(
+            """
+            SELECT
+                discord_id,
+                game_id,
+                ign,
+                missing_checks,
+                removed
+
+            FROM users
+
+            WHERE game_id = ?
+            """,
+
+            (
+                game_id,
+            )
+        )
+
+        return await cursor.fetchone()
+
+
+
+async def delete_user_by_game_id(
+    game_id
+):
+
+    async with aiosqlite.connect(DB_NAME) as db:
+
+        cursor = await db.execute(
+            """
+            SELECT
+                discord_id,
+                game_id,
+                ign,
+                missing_checks,
+                removed
+
+            FROM users
+
+            WHERE game_id = ?
+            """,
+
+            (
+                game_id,
+            )
+        )
+
+        user = await cursor.fetchone()
+
+        if user is None:
+
+            return None
+
+        await db.execute(
+            """
+            DELETE FROM users
+            WHERE discord_id = ?
+            """,
+
+            (
+                user[0],
+            )
+        )
+
+        await db.commit()
+
+        return user
