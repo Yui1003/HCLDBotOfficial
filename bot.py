@@ -14,16 +14,14 @@ from database import (
     mark_removed,
     get_verified_users,
     get_user_by_discord_id,
-    get_active_user_by_game_id
+    get_active_user_by_game_id,
+    get_user_by_game_id,
+    delete_user_by_game_id
 )
 
 
 load_dotenv()
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -35,15 +33,14 @@ LOG_CHANNEL_ID = int(
     os.getenv("LOG_CHANNEL_ID")
 )
 
-WELCOME_CHANNEL_ID = int(
-    os.getenv("WELCOME_CHANNEL_ID")
-)
-
 VERIFIED_CHANNEL_ID = int(
     os.getenv("VERIFIED_CHANNEL_ID")
 )
 
-# Official Discord server role
+WELCOME_CHANNEL_ID = int(
+    os.getenv("WELCOME_CHANNEL_ID")
+)
+
 MEMBER_ROLE_NAME = "HCV"
 
 ENABLE_KICK = (
@@ -54,19 +51,11 @@ ENABLE_KICK = (
 )
 
 
-# ============================================================
-# DISCORD INTENTS
-# ============================================================
-
 intents = discord.Intents.default()
 
 intents.members = True
 intents.message_content = True
 
-
-# ============================================================
-# BOT CLASS
-# ============================================================
 
 class ClanGuard(commands.Bot):
 
@@ -78,20 +67,20 @@ class ClanGuard(commands.Bot):
             id=GUILD_ID
         )
 
-        # Copy the currently global commands into guild scope
+        # Copy the (currently global) commands into guild scope
+        # BEFORE wiping the global ones, so they aren't lost.
         self.tree.copy_global_to(
             guild=guild
         )
 
-        # Clear old global commands
+        # Now clear the old global registrations so they stop
+        # showing up as duplicates.
         self.tree.clear_commands(
             guild=None
         )
 
-        # Delete old global registrations
         await self.tree.sync()
 
-        # Sync guild commands
         synced = await self.tree.sync(
             guild=guild
         )
@@ -107,11 +96,8 @@ bot = ClanGuard(
 )
 
 
-# ============================================================
-# CLAN CHECKING
-# ============================================================
-
 processed_players = set()
+
 
 
 @tasks.loop(seconds=10)
@@ -120,6 +106,7 @@ async def clan_check():
     try:
 
         players = await check_members()
+
 
     except Exception as e:
 
@@ -159,24 +146,9 @@ async def clan_check():
         discord_id = player["discord_id"]
 
 
-        if discord_id in processed_players:
-
-            continue
-
-
-        processed_players.add(
-            discord_id
-        )
-
-
         member = guild.get_member(
             discord_id
         )
-
-
-        if member is None:
-
-            continue
 
 
         print(
@@ -186,11 +158,18 @@ async def clan_check():
         )
 
 
-        # ----------------------------------------------------
-        # DRY RUN MODE
-        # ----------------------------------------------------
-
+        # Dry-run mode must not change the database or kick anyone.
         if not ENABLE_KICK:
+
+            if discord_id in processed_players:
+
+                continue
+
+
+            processed_players.add(
+                discord_id
+            )
+
 
             print(
                 "Kick disabled. Dry-run mode."
@@ -199,11 +178,23 @@ async def clan_check():
 
             if log_channel:
 
+                if member is not None:
+
+                    discord_target = member.mention
+
+                else:
+
+                    discord_target = (
+                        f"<@{discord_id}> "
+                        f"(already left the server)"
+                    )
+
+
                 await log_channel.send(
                     f"🧪 **Dry Run Detection**\n\n"
                     f"Player: `{player['ign']}`\n"
                     f"Ninja Saga ID: `{player['game_id']}`\n"
-                    f"Discord: {member.mention}\n\n"
+                    f"Discord: {discord_target}\n\n"
                     f"Kick disabled."
                 )
 
@@ -211,9 +202,44 @@ async def clan_check():
             continue
 
 
-        # ----------------------------------------------------
-        # PROTECTION FOR SERVER OWNER
-        # ----------------------------------------------------
+        # The clan API is the source of truth.
+        #
+        # Mark the verification as removed even when
+        # the Discord member has already left the server.
+        await mark_removed(
+            discord_id
+        )
+
+
+        print(
+            f"Marked verification removed: "
+            f"{player['ign']} ({player['game_id']})"
+        )
+
+
+        # If the user already left Discord, there is nothing to kick.
+        if member is None:
+
+            print(
+                f"Discord member {discord_id} "
+                f"is no longer in the server."
+            )
+
+
+            if log_channel:
+
+                await log_channel.send(
+                    f"🚪 **Automatic Clan Removal**\n\n"
+                    f"Player: `{player['ign']}`\n"
+                    f"Ninja Saga ID: `{player['game_id']}`\n"
+                    f"Discord ID: `{discord_id}`\n\n"
+                    f"The user had already left the Discord server. "
+                    f"Their verification record was marked as removed."
+                )
+
+
+            continue
+
 
         if member.id == guild.owner_id:
 
@@ -224,10 +250,6 @@ async def clan_check():
             continue
 
 
-        # ----------------------------------------------------
-        # CHECK BOT PERMISSION
-        # ----------------------------------------------------
-
         if not guild.me.guild_permissions.kick_members:
 
             print(
@@ -237,20 +259,11 @@ async def clan_check():
             continue
 
 
-        # ----------------------------------------------------
-        # KICK MEMBER
-        # ----------------------------------------------------
-
         try:
 
             await member.kick(
                 reason=
                 "No longer in Hidden Cloud Village"
-            )
-
-
-            await mark_removed(
-                discord_id
             )
 
 
@@ -277,9 +290,9 @@ async def clan_check():
             )
 
 
-# ============================================================
-# ACCESS SERVER BUTTON
-# ============================================================
+
+
+
 
 class AccessServerView(discord.ui.View):
 
@@ -302,7 +315,6 @@ class AccessServerView(discord.ui.View):
         button: discord.ui.Button
     ):
 
-        # Find HCV role
         role = discord.utils.get(
             interaction.guild.roles,
             name=MEMBER_ROLE_NAME
@@ -319,7 +331,6 @@ class AccessServerView(discord.ui.View):
             return
 
 
-        # Prevent duplicate role assignment
         if role in interaction.user.roles:
 
             await interaction.response.send_message(
@@ -332,16 +343,12 @@ class AccessServerView(discord.ui.View):
 
         try:
 
-            # Give HCV role
             await interaction.user.add_roles(
                 role
             )
 
 
-            # ------------------------------------------------
-            # SEND NEW MEMBER ANNOUNCEMENT
-            # ------------------------------------------------
-
+            # Send welcome message to #verified-members
             verified_channel = interaction.guild.get_channel(
                 VERIFIED_CHANNEL_ID
             )
@@ -378,10 +385,6 @@ class AccessServerView(discord.ui.View):
                 )
 
 
-            # ------------------------------------------------
-            # PRIVATE SUCCESS MESSAGE
-            # ------------------------------------------------
-
             await interaction.response.send_message(
                 "🎉 Welcome! You now have access to the server.",
                 ephemeral=True
@@ -391,34 +394,16 @@ class AccessServerView(discord.ui.View):
         except discord.Forbidden:
 
             await interaction.response.send_message(
-                "❌ I don't have permission to assign the HCV role.",
+                "❌ I don't have permission to assign roles.",
                 ephemeral=True
             )
 
 
-        except Exception as e:
 
-            print(
-                f"Access Server error: {e}"
-            )
-
-
-            if not interaction.response.is_done():
-
-                await interaction.response.send_message(
-                    "❌ Something went wrong while giving you access.",
-                    ephemeral=True
-                )
-
-
-# ============================================================
-# BOT READY
-# ============================================================
 
 @bot.event
 async def on_ready():
 
-    # Register persistent button view
     bot.add_view(
         AccessServerView()
     )
@@ -444,9 +429,7 @@ async def on_ready():
         clan_check.start()
 
 
-# ============================================================
-# SETUP WELCOME MESSAGE
-# ============================================================
+
 
 @app_commands.checks.has_permissions(
     administrator=True
@@ -459,29 +442,10 @@ async def setupwelcome(
     interaction: discord.Interaction
 ):
 
-    # Make sure this command is only used in #welcome
-    if interaction.channel_id != WELCOME_CHANNEL_ID:
-
-        await interaction.response.send_message(
-            f"❌ Please run this command in "
-            f"<#{WELCOME_CHANNEL_ID}>.",
-            ephemeral=True
-        )
-
-        return
-
-
-    # Check existing pinned messages
-    pinned_messages = []
-
-    async for message in interaction.channel.pins():
-
-        pinned_messages.append(
-            message
-        )
-
-
     # Prevent duplicate welcome messages
+    pinned_messages = await interaction.channel.pins()
+
+
     for message in pinned_messages:
 
         if (
@@ -499,7 +463,6 @@ async def setupwelcome(
             return
 
 
-    # Create welcome embed
     embed = discord.Embed(
         title="👋 Welcome to Hidden Cloud Village!",
         description=(
@@ -512,8 +475,8 @@ async def setupwelcome(
             "Use the `/verify` command.\n\n"
 
             "**Step 2️⃣**\n"
-            "Enter your **Ninja Saga User ID** "
-            "and **IGN** exactly as they appear in-game.\n\n"
+            "Enter your **Ninja Saga User ID** and **IGN** "
+            "exactly as they appear in-game.\n\n"
 
             "**Step 3️⃣**\n"
             "If verification succeeds, click the "
@@ -531,27 +494,12 @@ async def setupwelcome(
     )
 
 
-    # Send message
     message = await interaction.channel.send(
         embed=embed
     )
 
 
-    # Pin message
-    try:
-
-        await message.pin()
-
-    except discord.Forbidden:
-
-        await interaction.response.send_message(
-            "⚠️ The welcome message was created, "
-            "but I don't have permission to pin it. "
-            "Please give the bot **Manage Messages** permission.",
-            ephemeral=True
-        )
-
-        return
+    await message.pin()
 
 
     await interaction.response.send_message(
@@ -560,9 +508,7 @@ async def setupwelcome(
     )
 
 
-# ============================================================
-# VERIFY COMMAND
-# ============================================================
+
 
 @bot.tree.command(
     name="verify",
@@ -578,16 +524,14 @@ async def verify(
     ign: str
 ):
 
-    # Acknowledge immediately
+    # Talking to the clan API can take a moment,
+    # so acknowledge the interaction immediately.
     await interaction.response.defer(
         ephemeral=True
     )
 
 
-    # --------------------------------------------------------
-    # ONLY ALLOW VERIFY IN WELCOME CHANNEL
-    # --------------------------------------------------------
-
+    # Ensure /verify is only used in the welcome channel
     if interaction.channel_id != WELCOME_CHANNEL_ID:
 
         await interaction.followup.send(
@@ -599,10 +543,7 @@ async def verify(
         return
 
 
-    # --------------------------------------------------------
-    # CHECK EXISTING DISCORD ACCOUNT
-    # --------------------------------------------------------
-
+    # 1) This Discord account already has an active link?
     existing = await get_user_by_discord_id(
         interaction.user.id
     )
@@ -621,10 +562,7 @@ async def verify(
         return
 
 
-    # --------------------------------------------------------
-    # CHECK DUPLICATE GAME ID
-    # --------------------------------------------------------
-
+    # 2) Is this game_id already claimed by a different Discord account?
     conflict = await get_active_user_by_game_id(
         game_id
     )
@@ -641,10 +579,7 @@ async def verify(
         return
 
 
-    # --------------------------------------------------------
-    # VALIDATE AGAINST CLAN API
-    # --------------------------------------------------------
-
+    # 3) Validate against the live Hidden Cloud Village member list
     result = await check_clan_membership(
         game_id,
         ign
@@ -686,9 +621,7 @@ async def verify(
         return
 
 
-    # --------------------------------------------------------
-    # VERIFICATION SUCCESSFUL
-    # --------------------------------------------------------
+    # result["status"] == "ok"
 
     await add_user(
         interaction.user.id,
@@ -710,8 +643,6 @@ async def verify(
     )
 
 
-    # IMPORTANT:
-    # This button only appears after successful verification.
     await interaction.followup.send(
         embed=embed,
         view=AccessServerView(),
@@ -719,9 +650,9 @@ async def verify(
     )
 
 
-# ============================================================
-# CLANCHECK COMMAND
-# ============================================================
+
+
+
 
 @app_commands.checks.has_permissions(
     administrator=True
@@ -744,9 +675,9 @@ async def clancheck(
     )
 
 
-# ============================================================
-# VERIFIED COMMAND
-# ============================================================
+
+
+
 
 @app_commands.checks.has_permissions(
     administrator=True
@@ -771,90 +702,41 @@ async def verified(
         return
 
 
-    # Discord allows a maximum of 25 fields per embed.
-    # Split the members into multiple embeds.
-
-    pages = []
-
-
-    for i in range(
-        0,
-        len(users),
-        25
-    ):
-
-        embed = discord.Embed(
-            title="☁️ Verified Clan Members",
-            color=discord.Color.blue()
-        )
-
-
-        chunk = users[
-            i:i + 25
-        ]
-
-
-        for discord_id, game_id, ign in chunk:
-
-            member = interaction.guild.get_member(
-                discord_id
-            )
-
-
-            if member:
-
-                discord_name = member.display_name
-
-            else:
-
-                discord_name = "Unknown"
-
-
-            embed.add_field(
-                name=f"{game_id} - {ign}",
-                value=f"Discord: {discord_name}",
-                inline=False
-            )
-
-
-        # Show page number
-        page_number = (
-            len(pages) + 1
-        )
-
-        total_pages = (
-            (len(users) + 24) // 25
-        )
-
-
-        embed.set_footer(
-            text=f"Page {page_number} of {total_pages} • "
-                 f"{len(users)} verified members"
-        )
-
-
-        pages.append(
-            embed
-        )
-
-
-    # Send first page
-    await interaction.response.send_message(
-        embed=pages[0]
+    embed = discord.Embed(
+        title="☁️ Verified Clan Members",
+        color=discord.Color.blue()
     )
 
 
-    # Send remaining pages
-    for page in pages[1:]:
+    for discord_id, game_id, ign in users:
 
-        await interaction.followup.send(
-            embed=page
+        member = interaction.guild.get_member(
+            discord_id
         )
 
 
-# ============================================================
-# MODIFY VERIFY COMMAND
-# ============================================================
+        if member:
+
+            discord_name = member.display_name
+
+        else:
+
+            discord_name = "Unknown"
+
+
+        embed.add_field(
+            name=f"{game_id} - {ign}",
+            value=f"Discord: {discord_name}",
+            inline=False
+        )
+
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+
 
 @app_commands.checks.has_permissions(
     administrator=True
@@ -877,10 +759,7 @@ async def modifyverify(
     force: bool = False
 ):
 
-    if (
-        new_game_id is None
-        and new_ign is None
-    ):
+    if new_game_id is None and new_ign is None:
 
         await interaction.response.send_message(
             "❌ You need to provide at least one of "
@@ -906,10 +785,7 @@ async def modifyverify(
         )
 
 
-        if (
-            new_game_id is None
-            or new_ign is None
-        ):
+        if new_game_id is None or new_ign is None:
 
             return
 
@@ -924,7 +800,6 @@ async def modifyverify(
 
 
     old_game_id = current[1]
-
     old_ign = current[2]
 
 
@@ -942,24 +817,14 @@ async def modifyverify(
     )
 
 
-    # --------------------------------------------------------
-    # DUPLICATE GAME ID CHECK
-    # --------------------------------------------------------
-
-    if (
-        new_game_id is not None
-        and not force
-    ):
+    if new_game_id is not None and not force:
 
         conflict = await get_active_user_by_game_id(
             resolved_game_id
         )
 
 
-        if (
-            conflict
-            and conflict[0] != member.id
-        ):
+        if conflict and conflict[0] != member.id:
 
             await interaction.response.send_message(
                 f"❌ Ninja Saga ID `{resolved_game_id}` "
@@ -972,10 +837,6 @@ async def modifyverify(
 
             return
 
-
-    # --------------------------------------------------------
-    # UPDATE DATABASE
-    # --------------------------------------------------------
 
     await add_user(
         member.id,
@@ -992,9 +853,70 @@ async def modifyverify(
     )
 
 
-# ============================================================
-# GLOBAL COMMAND ERROR HANDLER
-# ============================================================
+
+
+@app_commands.checks.has_permissions(
+    administrator=True
+)
+@bot.tree.command(
+    name="delete",
+    description="Admin: permanently delete a verification record by Ninja Saga ID"
+)
+@app_commands.describe(
+    game_id="The Ninja Saga User ID of the record to delete"
+)
+async def delete(
+    interaction: discord.Interaction,
+    game_id: int
+):
+
+    user = await get_user_by_game_id(
+        game_id
+    )
+
+
+    if user is None:
+
+        await interaction.response.send_message(
+            f"❌ No verification record was found "
+            f"for Ninja Saga ID `{game_id}`.",
+            ephemeral=True
+        )
+
+        return
+
+
+    discord_id, stored_game_id, ign, missing_checks, removed = user
+
+
+    deleted = await delete_user_by_game_id(
+        game_id
+    )
+
+
+    if deleted is None:
+
+        await interaction.response.send_message(
+            f"❌ The verification record for Ninja Saga ID "
+            f"`{game_id}` could not be deleted.",
+            ephemeral=True
+        )
+
+        return
+
+
+    await interaction.response.send_message(
+        f"🗑️ **Verification record deleted successfully.**\n\n"
+        f"Ninja Saga ID: `{stored_game_id}`\n"
+        f"IGN: `{ign}`\n"
+        f"Discord ID: `{discord_id}`\n"
+        f"Previous status: "
+        f"`{'Removed' if removed else 'Active'}`",
+        ephemeral=True
+    )
+
+
+
 
 @bot.tree.error
 async def on_app_command_error(
@@ -1002,87 +924,20 @@ async def on_app_command_error(
     error: app_commands.AppCommandError
 ):
 
-    command_name = (
-        interaction.command.name
-        if interaction.command
-        else "unknown"
-    )
-
-
-    print(
-        f"❌ Command error in /{command_name}:"
-    )
-
-
-    import traceback
-
-    traceback.print_exception(
-        type(error),
-        error,
-        error.__traceback__
-    )
-
-
-    # --------------------------------------------------------
-    # MISSING ADMIN PERMISSIONS
-    # --------------------------------------------------------
-
     if isinstance(
         error,
         app_commands.MissingPermissions
     ):
 
-        message = (
-            "❌ You do not have permission to use this command."
+        await interaction.response.send_message(
+            "❌ You do not have permission to use this command.",
+            ephemeral=True
         )
 
-
-    # --------------------------------------------------------
-    # OTHER COMMAND ERRORS
-    # --------------------------------------------------------
-
-    else:
-
-        message = (
-            "❌ Something went wrong while processing "
-            "this command.\n\n"
-            "The error has been logged. "
-            "Please contact an administrator."
-        )
+        return
 
 
-    # --------------------------------------------------------
-    # SEND ERROR WITHOUT CAUSING ANOTHER ERROR
-    # --------------------------------------------------------
-
-    try:
-
-        if interaction.response.is_done():
-
-            await interaction.followup.send(
-                message,
-                ephemeral=True
-            )
-
-        else:
-
-            await interaction.response.send_message(
-                message,
-                ephemeral=True
-            )
+    raise error
 
 
-    except Exception as e:
-
-        print(
-            f"❌ Failed to send command error message: {e}"
-        )
-
-
-# ============================================================
-# START BOT
-# ============================================================
-
-bot.run(
-    TOKEN
-)
+bot.run(TOKEN)
