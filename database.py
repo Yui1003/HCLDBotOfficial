@@ -263,11 +263,64 @@ def _migrate_sync():
         conn.close()
 
 
+def _ensure_settings_sync():
+
+    conn = sqlite3.connect(DB_NAME)
+
+    try:
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.commit()
+
+    finally:
+
+        conn.close()
+
+
+async def get_setting(key, default=None):
+
+    async with aiosqlite.connect(DB_NAME) as db:
+
+        cursor = await db.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (key,)
+        )
+
+        row = await cursor.fetchone()
+
+        return row[0] if row else default
+
+
+async def set_setting(key, value):
+
+    async with aiosqlite.connect(DB_NAME) as db:
+
+        await db.execute(
+            """
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, str(value))
+        )
+
+        await db.commit()
+
+
 async def setup_database():
 
     global MIGRATION_REPORT
 
     MIGRATION_REPORT = _migrate_sync()
+
+    _ensure_settings_sync()
 
     if MIGRATION_REPORT:
 
