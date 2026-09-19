@@ -14,9 +14,11 @@ from database import (
     mark_removed,
     get_verified_users,
     get_user_by_discord_id,
-    get_active_user_by_game_id,
-    get_user_by_game_id,
-    delete_user_by_game_id
+    get_active_user_by_ign,
+    delete_user_by_ign,
+    delete_user_by_discord_id,
+    pop_migration_report,
+    DuplicateIgnError
 )
 
 
@@ -152,8 +154,7 @@ async def clan_check():
 
         print(
             f"Detected removal candidate: "
-            f"{player['ign']} "
-            f"({player['game_id']})"
+            f"{player['ign']}"
         )
 
 
@@ -189,7 +190,6 @@ async def clan_check():
                 await log_channel.send(
                     f"🧪 **Dry Run Detection**\n\n"
                     f"Player: `{player['ign']}`\n"
-                    f"Ninja Saga ID: `{player['game_id']}`\n"
                     f"Discord: {discord_target}\n\n"
                     f"Kick disabled."
                 )
@@ -207,7 +207,7 @@ async def clan_check():
 
         print(
             f"Marked verification removed: "
-            f"{player['ign']} ({player['game_id']})"
+            f"{player['ign']}"
         )
 
 
@@ -223,7 +223,6 @@ async def clan_check():
                 await log_channel.send(
                     f"🚪 **Automatic Clan Removal**\n\n"
                     f"Player: `{player['ign']}`\n"
-                    f"Ninja Saga ID: `{player['game_id']}`\n"
                     f"Discord ID: `{discord_id}`\n\n"
                     f"The user had already left the Discord server. "
                     f"Their verification record was marked as removed."
@@ -268,7 +267,6 @@ async def clan_check():
                 await log_channel.send(
                     f"🚪 **Automatic Clan Removal**\n\n"
                     f"Player: `{player['ign']}`\n"
-                    f"Ninja Saga ID: `{player['game_id']}`\n"
                     f"Discord: {member.mention}\n\n"
                     f"Reason: No longer in Hidden Cloud Village"
                 )
@@ -289,6 +287,14 @@ class AccessServerView(discord.ui.View):
 
     @discord.ui.button(label="Access Server", emoji="🚪", style=discord.ButtonStyle.green, custom_id="access_server_button")
     async def access_server(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Only verified (active) members may unlock the server.
+        record = await get_user_by_discord_id(interaction.user.id)
+        if record is None or record[3]:  # record[3] == removed
+            await interaction.response.send_message(
+                "\u274c You need to complete `/verify` first.",
+                ephemeral=True
+            )
+            return
         role = discord.utils.get(interaction.guild.roles, name=MEMBER_ROLE_NAME)
         if role is None:
             await interaction.response.send_message("❌ Member role not found.", ephemeral=True)
@@ -309,7 +315,7 @@ class AccessServerView(discord.ui.View):
                     interaction.user.id
                 )
 
-                ign = user[2] if user else "Unknown"
+                ign = user[1] if user else "Unknown"
 
                 embed = discord.Embed(
                     title="🎉 New Clan Member!",
@@ -348,6 +354,48 @@ async def on_ready():
     )
 
 
+    report = pop_migration_report()
+
+    if report:
+
+        log_channel = bot.get_channel(
+            LOG_CHANNEL_ID
+        )
+
+        if log_channel:
+
+            text = (
+                "\U0001f4e6 **Database migrated to IGN-based records**\n\n"
+                f"Old records: `{report['total_old']}`\n"
+                f"Active after migration: `{report['active']}`\n"
+                f"Backup file: `{report['backup']}`\n"
+            )
+
+            if report["duplicates"]:
+
+                text += (
+                    "\n\u26a0\ufe0f **Duplicate game names deactivated** "
+                    "(same name was linked to more than one Discord "
+                    "account; one was kept):\n"
+                )
+
+                for d in report["duplicates"]:
+
+                    text += (
+                        f"- `{d['ign']}`: <@{d['discord_id']}> deactivated, "
+                        f"<@{d['kept_discord_id']}> kept\n"
+                    )
+
+                text += (
+                    "\nUse `/modifyverify` (with `force`) if the wrong "
+                    "account was kept."
+                )
+
+            await log_channel.send(
+                text[:1990],
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+
     if not clan_check.is_running():
 
         clan_check.start()
@@ -385,7 +433,7 @@ async def setupwelcome(interaction: discord.Interaction):
             "Use the `/verify` command.\n\n"
 
             "**Step 2️⃣**\n"
-            "Enter your **Ninja Saga User ID** and **IGN** exactly as they appear in-game.\n\n"
+            "Enter your Ninja Saga **IGN** exactly as it appears in-game.\n\n"
 
             "**Step 3️⃣**\n"
             "If verification succeeds, click the **🚪 Access Server** button to unlock the rest of the server.\n\n"
@@ -414,15 +462,13 @@ async def setupwelcome(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="verify",
-    description="Link your Discord account with your Ninja Saga ID"
+    description="Link your Discord account with your Ninja Saga character name"
 )
 @app_commands.describe(
-    game_id="Your Ninja Saga User ID",
-    ign="Your Ninja Saga character name"
+    ign="Your Ninja Saga character name (IGN), exactly as shown in-game"
 )
 async def verify(
     interaction: discord.Interaction,
-    game_id: int,
     ign: str
 ):
 
@@ -433,21 +479,30 @@ async def verify(
     # Ensure /verify is only used in the welcome channel
     if interaction.channel_id != WELCOME_CHANNEL_ID:
         await interaction.followup.send(
-            f"❌ Please use `/verify` in <#{WELCOME_CHANNEL_ID}>.",
+            f"⚠️ Please use `/verify` in <#{WELCOME_CHANNEL_ID}>.",
             ephemeral=True
         )
         return
 
+    ign = ign.strip()
+
+    if not ign:
+        await interaction.followup.send(
+            "❌ Please enter your Ninja Saga character name."
+        )
+        return
+
     # 1) This Discord account already has an active link?
+    #    (one Discord account = one game name)
     existing = await get_user_by_discord_id(
         interaction.user.id
     )
 
-    if existing and not existing[4]:  # existing[4] == removed
+    if existing and not existing[3]:  # existing[3] == removed
 
         await interaction.followup.send(
-            f"❌ Your Discord account is already linked to "
-            f"Ninja Saga ID `{existing[1]}` (IGN: `{existing[2]}`).\n\n"
+            f"⚠️ Your Discord account is already linked to the "
+            f"Ninja Saga character `{existing[1]}`.\n\n"
             f"If this needs to change, please ask an admin to update it "
             f"with `/modifyverify`."
         )
@@ -455,33 +510,17 @@ async def verify(
         return
 
 
-    # 2) Is this game_id already claimed by a *different* Discord account?
-    conflict = await get_active_user_by_game_id(
-        game_id
-    )
-
-    if conflict and conflict[0] != interaction.user.id:
-
-        await interaction.followup.send(
-            f"❌ Ninja Saga ID `{game_id}` is already linked to another "
-            f"Discord account.\n\n"
-            f"If this is a mistake, please contact an admin."
-        )
-
-        return
-
-
-    # 3) Validate against the live Hidden Cloud Village member list
+    # 2) The name must really be a member of Hidden Cloud Village.
+    #    Nothing is accepted without this check.
     result = await check_clan_membership(
-        game_id,
         ign
     )
 
     if result["status"] == "error":
 
         await interaction.followup.send(
-            "⚠️ Couldn't reach the clan API right now. Please try again "
-            "in a moment."
+            "⚠️ Couldn't verify against the clan list right now. "
+            "Please try again in a moment."
         )
 
         return
@@ -490,53 +529,85 @@ async def verify(
     if result["status"] == "not_found":
 
         await interaction.followup.send(
-            f"❌ Ninja Saga ID `{game_id}` was not found in Hidden Cloud "
-            f"Village's member list.\n\n"
-            f"Make sure you're in the clan and that you entered the "
-            f"correct ID."
+            f"❌ `{ign}` was not found in Hidden Cloud Village's "
+            f"member list.\n\n"
+            f"Make sure you're in the clan and that you typed your "
+            f"character name exactly as it appears in-game "
+            f"(copy and paste works best)."
         )
 
         return
 
 
-    if result["status"] == "name_mismatch":
+    if result["status"] == "ambiguous":
+
+        candidates = ", ".join(
+            f"`{name}`" for name in result["candidates"]
+        )
 
         await interaction.followup.send(
-            f"❌ That ID belongs to Hidden Cloud Village, but the IGN "
-            f"you entered doesn't match.\n\n"
-            f"The registered in-game name for that ID is: "
-            f"`{result['actual_name']}`\n\n"
-            f"Please try again with that exact name."
+            f"⚠️ More than one clan member matches `{ign}`: "
+            f"{candidates}\n\n"
+            f"Please run `/verify` again with your exact name."
         )
 
         return
 
 
-    # result["status"] == "ok"
+    # result["status"] == "ok"  ->  use the game's exact spelling
+    verified_name = result["name"]
 
-    await add_user(
-        interaction.user.id,
-        game_id,
-        ign
+
+    # 3) Is this game name already claimed by a *different* Discord account?
+    conflict = await get_active_user_by_ign(
+        verified_name
     )
+
+    if conflict and conflict[0] != interaction.user.id:
+
+        await interaction.followup.send(
+            f"❌ The character `{verified_name}` is already linked to "
+            f"another Discord account.\n\n"
+            f"If this is a mistake, please contact an admin."
+        )
+
+        return
+
+
+    try:
+
+        await add_user(
+            interaction.user.id,
+            verified_name
+        )
+
+    except DuplicateIgnError:
+
+        # Someone else claimed it between the check above and the save.
+        await interaction.followup.send(
+            f"❌ The character `{verified_name}` is already linked to "
+            f"another Discord account.\n\n"
+            f"If this is a mistake, please contact an admin."
+        )
+
+        return
 
 
     embed = discord.Embed(
         title="✅ Verification Successful",
         description=(
             f"Welcome, {interaction.user.mention}!\n\n"
-            f"**IGN:** `{ign}`\n"
-            f"**Ninja Saga ID:** `{game_id}`\n\n"
+            f"**IGN:** `{verified_name}`\n\n"
             "Click the **Access Server** button below to unlock the server."
         ),
         color=discord.Color.green()
     )
 
     await interaction.followup.send(
-    embed=embed,
-    view=AccessServerView(),
-    ephemeral=True
-)
+        embed=embed,
+        view=AccessServerView(),
+        ephemeral=True
+    )
 
 
 
@@ -552,13 +623,50 @@ async def clancheck(
     interaction: discord.Interaction
 ):
 
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
     members = await get_clan_members()
 
+    if not members:
 
-    await interaction.response.send_message(
-        f"☁️ **Hidden Cloud Village API Check**\n\n"
+        await interaction.followup.send(
+            "⚠️ Couldn't read the Hidden Cloud Village member list "
+            "from the API.",
+            ephemeral=True
+        )
+
+        return
+
+    # Keep the message under Discord's 2000 character limit.
+    shown = []
+
+    length = 0
+
+    for name in members:
+
+        entry = f"`{name}`"
+
+        if length + len(entry) + 2 > 1500:
+            break
+
+        shown.append(entry)
+
+        length += len(entry) + 2
+
+    remaining = len(members) - len(shown)
+
+    text = ", ".join(shown)
+
+    if remaining > 0:
+        text += f" … and {remaining} more"
+
+    await interaction.followup.send(
+        f"🔎 **Hidden Cloud Village API Check**\n\n"
         f"Members found: `{len(members)}`\n\n"
-        f"`{members[:50]}`"
+        f"{text}",
+        ephemeral=True
     )
 
 
@@ -595,7 +703,7 @@ async def verified(
     for page_number, chunk in enumerate(chunks, start=1):
 
         embed = discord.Embed(
-            title="☁️ Verified Clan Members",
+            title="🥷 Verified Clan Members",
             color=discord.Color.blue()
         )
 
@@ -605,7 +713,7 @@ async def verified(
                 f"Total verified members: **{len(users)}**"
             )
 
-        for discord_id, game_id, ign in chunk:
+        for discord_id, ign in chunk:
 
             member = interaction.guild.get_member(
                 discord_id
@@ -617,7 +725,7 @@ async def verified(
                 discord_name = "Unknown"
 
             embed.add_field(
-                name=f"{game_id} - {ign}",
+                name=ign,
                 value=f"Discord: {discord_name}",
                 inline=False
             )
@@ -637,81 +745,100 @@ async def verified(
 @app_commands.checks.has_permissions(administrator=True)
 @bot.tree.command(
     name="modifyverify",
-    description="Admin: change a user's verified IGN and/or Ninja Saga ID"
+    description="Admin: change (or create) a user's verified IGN"
 )
 @app_commands.describe(
     member="The Discord member whose verification to modify",
-    new_game_id="New Ninja Saga ID (leave empty to keep current)",
-    new_ign="New IGN (leave empty to keep current)",
-    force="Bypass the duplicate-ID safety check (default: off)"
+    new_ign="The new Ninja Saga character name",
+    force="Take the name over if another Discord account already has it (default: off)",
+    skip_clan_check="Don't check the name against the clan member list (default: off)"
 )
 async def modifyverify(
     interaction: discord.Interaction,
     member: discord.Member,
-    new_game_id: int = None,
-    new_ign: str = None,
-    force: bool = False
+    new_ign: str,
+    force: bool = False,
+    skip_clan_check: bool = False
 ):
 
-    if new_game_id is None and new_ign is None:
+    await interaction.response.defer(
+        ephemeral=True
+    )
 
-        await interaction.response.send_message(
-            "❌ You need to provide at least one of `new_game_id` or "
-            "`new_ign` to change.",
+    current = await get_user_by_discord_id(
+        member.id
+    )
+
+    old_ign = current[1] if current else None
+
+    new_ign = new_ign.strip()
+
+    if not new_ign:
+
+        await interaction.followup.send(
+            "❌ `new_ign` cannot be empty.",
             ephemeral=True
         )
 
         return
 
 
-    current = await get_user_by_discord_id(
-        member.id
-    )
+    resolved_ign = new_ign
 
-    if current is None:
+    if not skip_clan_check:
 
-        await interaction.response.send_message(
-            f"❌ {member.mention} isn't verified yet. To enroll them, "
-            f"provide both `new_game_id` and `new_ign`.",
-            ephemeral=True
+        result = await check_clan_membership(
+            new_ign
         )
 
-        if new_game_id is None or new_ign is None:
+        if result["status"] == "error":
+
+            await interaction.followup.send(
+                "⚠️ Couldn't read the clan member list right now. "
+                "Try again in a moment, or use `skip_clan_check: True`.",
+                ephemeral=True
+            )
 
             return
 
+        if result["status"] == "not_found":
 
-        current = (member.id, None, None, 0, 0)
+            await interaction.followup.send(
+                f"❌ `{new_ign}` is not in Hidden Cloud Village's member "
+                f"list. Use `skip_clan_check: True` to override.",
+                ephemeral=True
+            )
+
+            return
+
+        if result["status"] == "ambiguous":
+
+            candidates = ", ".join(
+                f"`{name}`" for name in result["candidates"]
+            )
+
+            await interaction.followup.send(
+                f"⚠️ More than one clan member matches `{new_ign}`: "
+                f"{candidates}\n\nPlease use the exact name.",
+                ephemeral=True
+            )
+
+            return
+
+        resolved_ign = result["name"]
 
 
-    old_game_id = current[1]
-    old_ign = current[2]
+    if not force:
 
-    resolved_game_id = (
-        new_game_id
-        if new_game_id is not None
-        else old_game_id
-    )
-
-    resolved_ign = (
-        new_ign
-        if new_ign is not None
-        else old_ign
-    )
-
-
-    if new_game_id is not None and not force:
-
-        conflict = await get_active_user_by_game_id(
-            resolved_game_id
+        conflict = await get_active_user_by_ign(
+            resolved_ign
         )
 
         if conflict and conflict[0] != member.id:
 
-            await interaction.response.send_message(
-                f"❌ Ninja Saga ID `{resolved_game_id}` is already "
-                f"linked to another Discord account (<@{conflict[0]}>, "
-                f"IGN: `{conflict[2]}`).\n\n"
+            await interaction.followup.send(
+                f"❌ `{resolved_ign}` is already linked to another "
+                f"Discord account (<@{conflict[0]}>).\n\n"
                 f"If this is intentional, re-run the command with "
                 f"`force: True`.",
                 ephemeral=True
@@ -720,17 +847,29 @@ async def modifyverify(
             return
 
 
-    await add_user(
-        member.id,
-        resolved_game_id,
-        resolved_ign
-    )
+    try:
+
+        await add_user(
+            member.id,
+            resolved_ign,
+            force=force
+        )
+
+    except DuplicateIgnError as e:
+
+        await interaction.followup.send(
+            f"❌ `{resolved_ign}` is already linked to another "
+            f"Discord account (<@{e.holder_discord_id}>).",
+            ephemeral=True
+        )
+
+        return
 
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Updated verification for {member.mention}\n\n"
-        f"Ninja Saga ID: `{old_game_id}` → `{resolved_game_id}`\n"
-        f"IGN: `{old_ign}` → `{resolved_ign}`"
+        f"IGN: `{old_ign}` → `{resolved_ign}`",
+        ephemeral=True
     )
 
 
@@ -739,56 +878,68 @@ async def modifyverify(
 @app_commands.checks.has_permissions(administrator=True)
 @bot.tree.command(
     name="delete",
-    description="Admin: permanently delete a verification record by Ninja Saga ID"
+    description="Admin: permanently delete a verification record by IGN or Discord member"
 )
 @app_commands.describe(
-    game_id="The Ninja Saga User ID of the record to delete"
+    ign="The character name of the record to delete",
+    member="Or: the Discord member whose record to delete"
 )
 async def delete(
     interaction: discord.Interaction,
-    game_id: int
+    ign: str = None,
+    member: discord.Member = None
 ):
 
-    user = await get_user_by_game_id(
-        game_id
-    )
-
-
-    if user is None:
+    if not ign and member is None:
 
         await interaction.response.send_message(
-            f"❌ No verification record was found for Ninja Saga ID `{game_id}`.",
+            "❌ Provide either `ign` or `member`.",
             ephemeral=True
         )
 
         return
 
 
-    discord_id, stored_game_id, ign, missing_checks, removed = user
+    if member is not None:
+
+        row = await delete_user_by_discord_id(
+            member.id
+        )
+
+        deleted_rows = [row] if row else []
+
+    else:
+
+        deleted_rows = await delete_user_by_ign(
+            ign.strip()
+        )
 
 
-    deleted = await delete_user_by_game_id(
-        game_id
-    )
+    if not deleted_rows:
 
-
-    if deleted is None:
+        target = ign if member is None else member.mention
 
         await interaction.response.send_message(
-            f"❌ The verification record for Ninja Saga ID `{game_id}` "
-            f"could not be deleted.",
+            f"❌ No verification record was found for {target}.",
             ephemeral=True
         )
 
         return
+
+
+    lines = []
+
+    for discord_id, stored_ign, missing_checks, removed in deleted_rows:
+
+        lines.append(
+            f"IGN: `{stored_ign}` | Discord ID: `{discord_id}` | "
+            f"Previous status: `{'Removed' if removed else 'Active'}`"
+        )
 
 
     await interaction.response.send_message(
-        f"🗑️ **Verification record deleted successfully.**\n\n"
-        f"Ninja Saga ID: `{stored_game_id}`\n"
-        f"IGN: `{ign}`\n"
-        f"Discord ID: `{discord_id}`\n"
-        f"Previous status: `{'Removed' if removed else 'Active'}`",
+        "🗑️ **Verification record deleted successfully.**\n\n"
+        + "\n".join(lines),
         ephemeral=True
     )
 
