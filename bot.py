@@ -18,6 +18,8 @@ from database import (
     delete_user_by_ign,
     delete_user_by_discord_id,
     pop_migration_report,
+    get_setting,
+    set_setting,
     DuplicateIgnError
 )
 
@@ -65,6 +67,14 @@ class ClanGuard(commands.Bot):
 
         await setup_database()
 
+        global kick_enabled
+
+        saved = await get_setting("kick_enabled")
+
+        if saved is not None:
+
+            kick_enabled = (saved == "True")
+
         guild = discord.Object(
             id=GUILD_ID
         )
@@ -99,6 +109,10 @@ bot = ClanGuard(
 
 
 processed_players = set()
+
+# Live kick switch. Starts from the ENABLE_KICK value in .env, then the
+# value saved by /kickmode (stored in the database) takes over.
+kick_enabled = ENABLE_KICK
 
 
 
@@ -159,7 +173,7 @@ async def clan_check():
 
 
         # Dry-run mode must not change the database or kick anyone.
-        if not ENABLE_KICK:
+        if not kick_enabled:
 
             if discord_id in processed_players:
 
@@ -350,7 +364,7 @@ async def on_ready():
 
 
     print(
-        f"Kick mode: {ENABLE_KICK}"
+        f"Kick mode: {kick_enabled}"
     )
 
 
@@ -940,6 +954,52 @@ async def delete(
     await interaction.response.send_message(
         "🗑️ **Verification record deleted successfully.**\n\n"
         + "\n".join(lines),
+        ephemeral=True
+    )
+
+
+@app_commands.checks.has_permissions(administrator=True)
+@bot.tree.command(
+    name="kickmode",
+    description="Admin: turn automatic kicking on/off, or show its current state"
+)
+@app_commands.describe(
+    enabled="True = kick members who left the clan. False = only log (dry run). Leave empty to just check."
+)
+async def kickmode(
+    interaction: discord.Interaction,
+    enabled: bool = None
+):
+
+    global kick_enabled
+
+    if enabled is None:
+
+        await interaction.response.send_message(
+            f"⚙️ Automatic kicking is currently "
+            f"**{'ON' if kick_enabled else 'OFF (dry run)'}**.",
+            ephemeral=True
+        )
+
+        return
+
+    kick_enabled = enabled
+
+    await set_setting(
+        "kick_enabled",
+        enabled
+    )
+
+    # Let dry-run reports fire again after switching modes.
+    processed_players.clear()
+
+    print(
+        f"Kick mode set to {enabled} by {interaction.user}"
+    )
+
+    await interaction.response.send_message(
+        f"⚙️ Automatic kicking is now "
+        f"**{'ON' if enabled else 'OFF (dry run)'}**.",
         ephemeral=True
     )
 
