@@ -1,11 +1,15 @@
 import aiohttp
 import os
+import re
+import unicodedata
 
 from dotenv import load_dotenv
 
 from database import (
     get_users,
-    update_missing
+    update_missing,
+    update_ign,
+    normalize_ign
 )
 
 
@@ -20,21 +24,111 @@ CLAN_NAME = os.getenv(
 )
 
 
-def _normalize_name(name: str) -> str:
-    """Trim + casefold so tiny formatting differences don't cause false mismatches."""
+# ---------------------------------------------------------------------------
+# Name matching
+#
+# The API no longer exposes user IDs or clan IDs, so a player is identified
+# purely by the in-game name listed in the Hidden Cloud Village member_list.
+# Matching is done in tiers, from strictest to most forgiving. A name only
+# counts if it resolves to exactly ONE clan member.
+# ---------------------------------------------------------------------------
 
-    return name.strip().casefold()
-
-
-async def get_clan_data():
+def _loose_key(name: str) -> str:
     """
-    Fetches the live rankings JSON and returns the member_list
-    (list of {"id", "level", "name", "reputation"}) for CLAN_NAME.
+    Ignores case, spacing, accents/combining marks, invisible characters
+    and punctuation/symbols (e.g. the tag decorations and stars used in
+    Ninja Saga names). Returns "" if nothing meaningful is left.
+    """
 
-    Returns None if the API could not be reached, returned a bad
-    status, or the clan could not be found in the payload — callers
-    should treat None as "could not verify right now", not as
-    "clan is empty".
+    name = unicodedata.normalize("NFKC", name or "")
+
+    return "".join(
+        ch for ch in name
+        if unicodedata.category(ch)[0] in ("L", "N")
+    ).casefold()
+
+
+def _without_tag(name: str) -> str:
+    """Drops a leading clan tag: 'XX Eliana' -> 'Eliana'."""
+
+    parts = re.split(r"\s+", (name or "").strip(), maxsplit=1)
+
+    if len(parts) == 2:
+
+        return parts[1]
+
+    return ""
+
+
+def find_member(ign: str, member_names: list):
+    """
+    Finds `ign` in the clan roster.
+
+    Returns a dict:
+        {"status": "ok", "name": <exact name used by the game>}
+        {"status": "ambiguous", "candidates": [names...]}
+        {"status": "not_found"}
+    """
+
+    typed_exact = normalize_ign(ign)
+
+    typed_loose = _loose_key(ign)
+
+    if not typed_exact:
+
+        return {"status": "not_found"}
+
+    tiers = [
+        lambda n: normalize_ign(n) == typed_exact,
+    ]
+
+    if typed_loose:
+
+        tiers.append(
+            lambda n: _loose_key(n) == typed_loose
+        )
+
+        tiers.append(
+            lambda n: _loose_key(_without_tag(n)) == typed_loose
+        )
+
+    for matches_tier in tiers:
+
+        hits = [
+            name for name in member_names
+            if matches_tier(name)
+        ]
+
+        if len(hits) == 1:
+
+            return {
+                "status": "ok",
+                "name": hits[0]
+            }
+
+        if len(hits) > 1:
+
+            return {
+                "status": "ambiguous",
+                "candidates": hits[:5]
+            }
+
+    return {
+        "status": "not_found"
+    }
+
+
+# ---------------------------------------------------------------------------
+# API access
+# ---------------------------------------------------------------------------
+
+async def _fetch_roster():
+    """
+    Returns (status, names):
+
+        ("ok", [names])       roster fetched
+        ("error", None)       API unreachable / bad response
+        ("no_clan", None)     API fine, but the clan isn't in it
     """
 
     try:
@@ -55,11 +149,13 @@ async def get_clan_data():
                         f"API returned HTTP {response.status}"
                     )
 
-                    return None
+                    return "error", None
 
-
-                data = await response.json()
-
+                # content_type=None: don't fail if the static host serves
+                # the JSON with a generic content type.
+                data = await response.json(
+                    content_type=None
+                )
 
     except Exception as e:
 
@@ -67,96 +163,88 @@ async def get_clan_data():
             f"API connection error: {e}"
         )
 
-        return None
+        return "error", None
 
 
+    try:
 
-    for clan in data.get("clans", []):
+        target = normalize_ign(CLAN_NAME)
 
-        if clan.get("name") == CLAN_NAME:
+        for clan in data.get("clans", []):
 
-            return clan.get(
-                "member_list",
-                []
-            )
+            if normalize_ign(clan.get("name", "")) == target:
+
+                names = [
+                    member["name"]
+                    for member in clan.get("member_list", [])
+                    if isinstance(member, dict)
+                    and isinstance(member.get("name"), str)
+                    and member["name"].strip()
+                ]
+
+                return "ok", names
+
+    except Exception as e:
+
+        print(
+            f"API payload error: {e}"
+        )
+
+        return "error", None
 
 
     print(
         f"Clan not found: {CLAN_NAME}"
     )
 
-    return None
-
+    return "no_clan", None
 
 
 async def get_clan_members():
-    """Backwards-compatible helper: just the list of member IDs (ints)."""
+    """
+    List of member names (str) currently in CLAN_NAME.
 
-    member_list = await get_clan_data()
+    Returns [] if the API could not be reached or the clan wasn't found,
+    so callers must treat an empty list as "could not verify", never as
+    "the clan is empty".
+    """
 
-    if member_list is None:
+    status, names = await _fetch_roster()
+
+    if status != "ok":
 
         return []
 
-
-    return [
-        member["id"]
-        for member in member_list
-    ]
+    return names
 
 
-
-async def check_clan_membership(game_id: int, ign: str):
+async def check_clan_membership(ign: str):
     """
-    Validates a (game_id, ign) pair against the live Hidden Cloud
-    Village member list.
+    Validates an IGN against the live Hidden Cloud Village member list.
 
     Returns a dict with a "status" key, one of:
 
-        "ok"            - game_id is in the clan and ign matches
-        "not_found"     - game_id is not in the clan's member list
-        "name_mismatch" - game_id is in the clan, but the ign given
-                           doesn't match. Includes "actual_name".
-        "error"         - couldn't reach / parse the API right now.
+        "ok"         - ign is a member. Includes "name": the exact in-game
+                       spelling, which is what should be stored.
+        "not_found"  - no member of the clan has that name.
+        "ambiguous"  - more than one member matches; the user must type the
+                       exact name. Includes "candidates".
+        "error"      - couldn't reach / parse the API right now, or the clan
+                       wasn't in the data. Nobody is verified in this case.
     """
 
-    member_list = await get_clan_data()
+    status, names = await _fetch_roster()
 
-    if member_list is None:
+    if status != "ok" or not names:
 
         return {
             "status": "error"
         }
 
-
-    for member in member_list:
-
-        if member.get("id") == game_id:
-
-            actual_name = member.get(
-                "name",
-                ""
-            )
-
-
-            if _normalize_name(actual_name) == _normalize_name(ign):
-
-                return {
-                    "status": "ok"
-                }
-
-
-            return {
-                "status": "name_mismatch",
-                "actual_name": actual_name
-            }
-
-
-    return {
-        "status": "not_found"
-    }
-
-
+    return find_member(
+        ign,
+        names
+    )
 
 
 async def check_members():
@@ -178,7 +266,6 @@ async def check_members():
 
     for (
         discord_id,
-        game_id,
         ign,
         missing,
         removed
@@ -194,13 +281,34 @@ async def check_members():
 
 
 
-        if game_id not in clan_members:
+        match = find_member(
+            ign,
+            clan_members
+        )
+
+
+        # "ambiguous" still means someone with that name is in the clan,
+        # so it is never treated as a departure.
+        if match["status"] == "not_found":
 
             missing += 1
 
         else:
 
             missing = 0
+
+
+            # Migrated records may hold an older spelling of the name.
+            # Refresh it to the game's exact spelling when that's safe.
+            if (
+                match["status"] == "ok"
+                and match["name"] != ign
+            ):
+
+                await update_ign(
+                    discord_id,
+                    match["name"]
+                )
 
 
 
@@ -211,15 +319,14 @@ async def check_members():
 
 
 
-        # Require 6 failed checks
-        # 6 x 10 seconds = about 1 minute
+        # Require 3 failed checks in a row
+        # 3 x 10 seconds = about 30 seconds
 
         if missing >= 3:
 
             results.append(
                 {
                     "discord_id": discord_id,
-                    "game_id": game_id,
                     "ign": ign
                 }
             )
